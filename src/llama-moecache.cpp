@@ -35,6 +35,10 @@ struct layer_state {
     // worth a PCIe upload, so a one-off cannot displace a hot expert
     std::vector<uint8_t>  score;
 
+    // host_table has entries that dev_table does not have yet; flushed as ONE
+    // device write at the end of step() (see flush_tables)
+    bool table_dirty = false;
+
     uint64_t n_hit  = 0;
     uint64_t n_miss = 0;
 };
@@ -71,6 +75,19 @@ struct moe_cache {
     // speculative batch wider than max_batch): a hit rate is misleading without
     // knowing how often the cache never got a chance
     uint64_t n_skip_wide_batch = 0;
+
+    // table maintenance: device table writes are batched per layer per step
+    // (one blocking copy per dirty layer instead of one per changed entry)
+    uint64_t n_table_entries = 0; // entry changes (what the unbatched code would have copied one by one)
+    uint64_t n_table_flushes = 0; // device copies actually issued
+
+    // LLAMA_MOE_CACHE_VERIFY=<level>: 1 = read back every device table after each
+    // step and compare with the host shadow; 2 = additionally read back every
+    // freshly published slot and compare with the host expert bytes. Any
+    // mismatch is logged and aborts the process. Zero cost when off.
+    int      verify           = 0;
+    uint64_t n_verify_tables  = 0;
+    uint64_t n_verify_slots   = 0;
 
     const llama_model * model = nullptr; // whose tensors the table entries name
 
@@ -186,10 +203,78 @@ void upload_slice(ggml_tensor * dst_c, const ggml_tensor * src, int32_t expert, 
     ggml_backend_tensor_set(dst_c, (const char *) src->data + (size_t) expert*sz, (size_t) slot*dst_c->nb[2], sz);
 }
 
-void set_table_entry(llama_moe_cache_layer & pub, int32_t expert, int32_t slot_or_dummy) {
+// Record a table change on the host shadow only. The device table is brought
+// up to date by flush_tables() before step() returns; step() runs between two
+// graph executions (after the scheduler fence), so no graph can observe the
+// device table in between and the deferred write is indistinguishable from the
+// immediate one.
+void set_table_entry(moe_cache * mc, layer_state & ls, int32_t expert, int32_t slot_or_dummy) {
     const int32_t v = slot_or_dummy;
-    ggml_backend_tensor_set(pub.dev_table,  &v, (size_t) expert*sizeof(int32_t), sizeof(int32_t));
-    ggml_backend_tensor_set(pub.host_table, &v, (size_t) expert*sizeof(int32_t), sizeof(int32_t));
+    ggml_backend_tensor_set(ls.pub.host_table, &v, (size_t) expert*sizeof(int32_t), sizeof(int32_t));
+    ls.table_dirty = true;
+    mc->n_table_entries++;
+}
+
+// One device write per dirty layer: the whole host shadow (n_expert x 4 bytes,
+// 1-2 KB) replaces the per-entry 4-byte blocking copies. The device table ends
+// up equal to the host shadow, which is exactly the state the per-entry writes
+// would have produced (both received the same sequence of values).
+void flush_tables(moe_cache * mc) {
+    for (auto & ls : mc->layers) {
+        if (!ls.table_dirty) {
+            continue;
+        }
+        ggml_backend_tensor_set(ls.pub.dev_table, ls.pub.host_table->data, 0, ggml_nbytes(ls.pub.host_table));
+        ls.table_dirty = false;
+        mc->n_table_flushes++;
+    }
+}
+
+// LLAMA_MOE_CACHE_VERIFY>=1: the device tables must equal the host shadows
+// after every step. A mismatch means a lost or torn table write - the exact
+// failure the batched flush could introduce - so abort instead of serving
+// silently wrong experts.
+void verify_tables(moe_cache * mc) {
+    std::vector<int32_t> dev;
+    for (auto & ls : mc->layers) {
+        const size_t nb = ggml_nbytes(ls.pub.host_table);
+        dev.resize(nb/sizeof(int32_t));
+        ggml_backend_tensor_get(ls.pub.dev_table, dev.data(), 0, nb);
+        const int32_t * host = (const int32_t *) ls.pub.host_table->data;
+        for (size_t e = 0; e < dev.size(); ++e) {
+            if (dev[e] != host[e]) {
+                LLAMA_LOG_ERROR("moe-cache: VERIFY FAILED at step %" PRIu64 ": layer %d expert %zu: device table=%d host table=%d "
+                        "(expert_slot=%d, n_slots=%d)\n",
+                        mc->n_steps, ls.pub.il, e, dev[e], host[e], ls.expert_slot[e], mc->n_slots);
+                GGML_ABORT("moe-cache: device/host table mismatch");
+            }
+        }
+        mc->n_verify_tables++;
+    }
+}
+
+// LLAMA_MOE_CACHE_VERIFY>=2: a freshly published slot must hold exactly the
+// host expert's bytes in all three tensors (catches a bad upload before the
+// prefill D2D path or the cache chain would serve it).
+void verify_slot(moe_cache * mc, layer_state & ls, int32_t expert, int32_t slot) {
+    const ggml_tensor * dst[3] = { ls.pub.up_c,   ls.pub.gate_c,   ls.pub.down_c   };
+    const ggml_tensor * src[3] = { ls.pub.up_src, ls.pub.gate_src, ls.pub.down_src };
+    std::vector<uint8_t> buf;
+    for (int k = 0; k < 3; ++k) {
+        const size_t sz = src[k]->nb[2];
+        buf.resize(sz);
+        ggml_backend_tensor_get(dst[k], buf.data(), (size_t) slot*dst[k]->nb[2], sz);
+        const uint8_t * ref = (const uint8_t *) src[k]->data + (size_t) expert*sz;
+        if (memcmp(buf.data(), ref, sz) != 0) {
+            size_t off = 0;
+            while (off < sz && buf[off] == ref[off]) { off++; }
+            LLAMA_LOG_ERROR("moe-cache: VERIFY FAILED at step %" PRIu64 ": layer %d slot %d expert %d tensor %s: "
+                    "device bytes differ from host at offset %zu of %zu (dev=0x%02x host=0x%02x)\n",
+                    mc->n_steps, ls.pub.il, slot, expert, dst[k]->name, off, sz, buf[off], ref[off]);
+            GGML_ABORT("moe-cache: slot bytes differ from host expert");
+        }
+    }
+    mc->n_verify_slots++;
 }
 
 } // namespace
@@ -470,6 +555,15 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
             }
         }
 
+        if (const char * v = getenv("LLAMA_MOE_CACHE_VERIFY")) {
+            mc->verify = atoi(v);
+            if (mc->verify > 0) {
+                LLAMA_LOG_INFO("%s: MoE expert cache VERIFY level %d: device tables are read back and compared with the host "
+                        "shadow after every step%s; a mismatch aborts the process\n", __func__, mc->verify,
+                        mc->verify >= 2 ? ", every published slot is compared with the host expert bytes" : "");
+            }
+        }
+
         mc->worker = std::thread([mc]() {
             for (;;) {
                 upload_job j;
@@ -557,11 +651,14 @@ void llama_moe_cache_step(ggml_backend_sched * sched) {
         std::lock_guard<std::mutex> lk(mc->mtx);
         for (const auto & j : mc->done) {
             auto & ls = mc->layers[j.layer_idx];
+            if (mc->verify >= 2) {
+                verify_slot(mc, ls, j.expert, j.slot); // before the mapping is published
+            }
             ls.slot_expert[j.slot]     = j.expert;
             ls.expert_slot[j.expert]   = j.slot;
             ls.slot_last_use[j.slot]   = ++mc->clock;
             ls.slot_in_flight[j.slot]  = false;
-            set_table_entry(ls.pub, j.expert, j.slot);
+            set_table_entry(mc, ls, j.expert, j.slot);
         }
         mc->done.clear();
     }
@@ -614,7 +711,7 @@ void llama_moe_cache_step(ggml_backend_sched * sched) {
             if (victim >= 0) {
                 ls.expert_slot[victim] = -1;
                 ls.slot_expert[slot]   = -1;
-                set_table_entry(ls.pub, victim, mc->n_slots);
+                set_table_entry(mc, ls, victim, mc->n_slots);
                 mc->n_evictions++;
             }
             ls.slot_in_flight[slot] = true;
@@ -628,6 +725,13 @@ void llama_moe_cache_step(ggml_backend_sched * sched) {
         ls.pending.clear();
     }
     mc->wcv.notify_one();
+
+    // 3) publish the table changes of this step to the device: one write per
+    //    dirty layer. Still inside the fence window (no graph submitted yet).
+    flush_tables(mc);
+    if (mc->verify >= 1) {
+        verify_tables(mc);
+    }
 
     // at --log-verbosity 4 (trace) DEBUG is suppressed, so report at INFO on step 1
     // (existence) and step 32 (a warmed hit rate), then every 256 steps - which is
@@ -700,6 +804,14 @@ void llama_moe_cache_print_stats() {
             __func__, mc->n_uploads, mc->n_evictions,
             mc->bytes_uploaded/1024.0/1024.0, bytes_served/1024.0/1024.0,
             mc->bytes_uploaded ? (double) bytes_served/(double) mc->bytes_uploaded : 0.0);
+    LLAMA_LOG_INFO("%s: MoE expert cache tables: entry-changes=%" PRIu64 " device-writes=%" PRIu64
+            " (batched per layer per step)%s\n",
+            __func__, mc->n_table_entries, mc->n_table_flushes,
+            mc->verify > 0 ? " | VERIFY passed" : "");
+    if (mc->verify > 0) {
+        LLAMA_LOG_INFO("%s: MoE expert cache VERIFY level %d: table-checks=%" PRIu64 " slot-checks=%" PRIu64 " mismatches=0\n",
+                __func__, mc->verify, mc->n_verify_tables, mc->n_verify_slots);
+    }
     if (mc->n_skip_wide_batch) {
         LLAMA_LOG_INFO("%s: MoE expert cache bypassed on %" PRIu64 " steps: batch wider than --moe-expert-cache-max-batch (%d), "
                 "e.g. speculative decoding drafts. The cache cannot be used for those tokens.\n",
