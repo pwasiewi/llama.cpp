@@ -353,6 +353,17 @@ extern "C" {
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
 
+    // Expert-source callback (optional). When the scheduler offloads a host-resident MoE expert weight tensor
+    // (MUL_MAT_ID src0) to a device for a batch, it copies the used experts host -> device. If the application
+    // keeps a device-resident copy of some experts (an expert cache), it can register this callback: for a
+    // weight tensor it must set *cache to a device tensor with the same type, ne[0], ne[1] and nb[2] as the
+    // weight whose 3rd dimension holds expert copies, fill slot[0..n_expert) with the index of each expert in
+    // *cache (or -1 when not resident), and return true. Resident experts are then copied device -> device from
+    // *cache instead of from host. The bytes must be identical to the host expert, and the mapping must stay
+    // valid (no slot overwritten) until the scheduler is synchronized.
+    typedef bool (*ggml_backend_sched_expert_src_callback)(const struct ggml_tensor * weight, const struct ggml_tensor ** cache, int32_t * slot, int64_t n_expert, void * user_data);
+    GGML_API void                 ggml_backend_sched_set_expert_src_callback(ggml_backend_sched_t sched, ggml_backend_sched_expert_src_callback callback, void * user_data);
+
     //
     // Meta backend
     //

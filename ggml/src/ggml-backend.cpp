@@ -826,6 +826,10 @@ struct ggml_backend_sched {
     ggml_backend_sched_eval_callback callback_eval;
     void * callback_eval_user_data;
 
+    // optional device-resident source for offloaded MoE expert weights (see ggml_backend_sched_set_expert_src_callback)
+    ggml_backend_sched_expert_src_callback callback_expert_src;
+    void * callback_expert_src_user_data;
+
     char * context_buffer;
     size_t context_buffer_size;
 
@@ -1666,6 +1670,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
+    std::vector<int32_t> expert_slot; // per offloaded weight: expert -> index in the device-resident cache, -1 = copy from host
 
     int prev_backend_id = -1;
 
@@ -1757,6 +1762,23 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         prev_ids_tensor = ids_tensor;
                     }
 
+                    // device-resident copies of some experts (an application-managed expert cache): those
+                    // experts are copied device -> device from the cache instead of host -> device.
+                    // Every byte written into input_cpy is identical to the host path (the cache holds the
+                    // host expert's bytes, and the padding after a run is still taken from host), so the
+                    // result is bit-identical; only the source of the bytes changes.
+                    const ggml_tensor * expert_cache = nullptr;
+                    bool use_expert_cache = false;
+                    if (sched->callback_expert_src && split_backend->iface.cpy_tensor_range_async && node->op == GGML_OP_MUL_MAT_ID) {
+                        expert_slot.assign(n_expert, -1);
+                        use_expert_cache = sched->callback_expert_src(input, &expert_cache, expert_slot.data(), n_expert, sched->callback_expert_src_user_data)
+                            && expert_cache != nullptr
+                            && expert_cache->type  == input->type
+                            && expert_cache->ne[0] == input->ne[0]
+                            && expert_cache->ne[1] == input->ne[1]
+                            && expert_cache->nb[2] == expert_size;
+                    }
+
                     // group consecutive experts and copy them together
                     auto copy_experts = [&](int32_t first_id, int32_t last_id) {
                         const size_t expert_offset = first_id * expert_size;
@@ -1764,12 +1786,53 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         const size_t padding = std::min<size_t>(expert_size, 512);
                         const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
 
-                        ggml_backend_tensor_set_async(split_backend,
-                            input_cpy,
-                            (const uint8_t *)input->data + expert_offset, expert_offset,
-                            // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
-                            // this is necessary for MMQ in the CUDA backend
-                            expert_size_copy + padding_end);
+                        if (!use_expert_cache) {
+                            ggml_backend_tensor_set_async(split_backend,
+                                input_cpy,
+                                (const uint8_t *)input->data + expert_offset, expert_offset,
+                                // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
+                                // this is necessary for MMQ in the CUDA backend
+                                expert_size_copy + padding_end);
+                            return;
+                        }
+
+                        // same bytes, two sources: runs of non-resident experts come from host (one copy per run,
+                        // the last run keeps the padding bytes), resident experts come from the cache slot (D2D)
+                        int32_t host_first = -1;
+                        bool    padding_done = false;
+                        auto flush_host = [&](int32_t host_last) {
+                            if (host_first < 0) {
+                                return;
+                            }
+                            const size_t off = (size_t) host_first * expert_size;
+                            const size_t pad = host_last == last_id ? padding_end : 0;
+                            ggml_backend_tensor_set_async(split_backend, input_cpy,
+                                (const uint8_t *)input->data + off, off,
+                                (size_t) (host_last - host_first + 1) * expert_size + pad);
+                            padding_done = padding_done || pad > 0;
+                            host_first = -1;
+                        };
+                        for (int32_t id = first_id; id <= last_id; ++id) {
+                            const int32_t slot = expert_slot[id];
+                            const bool from_cache = slot >= 0
+                                && (size_t) slot * expert_size + expert_size <= ggml_nbytes(expert_cache)
+                                && split_backend->iface.cpy_tensor_range_async(split_backend,
+                                        expert_cache, (size_t) slot * expert_size,
+                                        input_cpy,    (size_t) id   * expert_size, expert_size);
+                            if (from_cache) {
+                                flush_host(id - 1);
+                            } else if (host_first < 0) {
+                                host_first = id;
+                            }
+                        }
+                        flush_host(last_id);
+                        if (padding_end > 0 && !padding_done) {
+                            // the run ended with a cached expert: its padding (the first bytes of the next,
+                            // unused expert) still comes from host, exactly as in the single-copy path
+                            const size_t off = (size_t) (last_id + 1) * expert_size;
+                            ggml_backend_tensor_set_async(split_backend, input_cpy,
+                                (const uint8_t *)input->data + off, off, padding_end);
+                        }
                     };
 
                     int id = 0;
@@ -2062,6 +2125,12 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_eval = callback;
     sched->callback_eval_user_data = user_data;
+}
+
+void ggml_backend_sched_set_expert_src_callback(ggml_backend_sched_t sched, ggml_backend_sched_expert_src_callback callback, void * user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_expert_src = callback;
+    sched->callback_expert_src_user_data = user_data;
 }
 
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {

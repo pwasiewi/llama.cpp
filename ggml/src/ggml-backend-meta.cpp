@@ -2487,6 +2487,7 @@ static const ggml_backend_i ggml_backend_meta_i = {
     /* .event_record            = */ nullptr,
     /* .event_wait              = */ nullptr,
     /* .graph_optimize          = */ nullptr,
+    /* .cpy_tensor_range_async  = */ nullptr,
 };
 
 bool ggml_backend_is_meta(ggml_backend_t backend) {

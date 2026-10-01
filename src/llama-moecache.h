@@ -86,5 +86,12 @@ struct ggml_backend_sched;
 // finish scheduled graph execution, then publish throttled LRU updates
 void llama_moe_cache_step(ggml_backend_sched * sched);
 
+// ggml_backend_sched_expert_src_callback: lets the scheduler source the prefill
+// (op-offload) copy of an expert that is resident in the cache from its slot
+// (device -> device) instead of from host. No-op (returns false) when the cache
+// is disabled, the tensor is not a cached layer's expert weight, or
+// LLAMA_MOE_CACHE_PREFILL_D2D=0. Registered on every scheduler the context creates.
+bool llama_moe_cache_expert_src(const ggml_tensor * weight, const ggml_tensor ** cache, int32_t * slot, int64_t n_expert, void * user_data);
+
 // log cumulative cache statistics (safe to call at any time; no-op when disabled)
 void llama_moe_cache_print_stats();

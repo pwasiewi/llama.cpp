@@ -102,6 +102,16 @@ struct moe_cache {
     std::vector<layer_state> layers;
     std::map<const ggml_tensor *, size_t> by_up_src;
 
+    // any of a cached layer's three host expert tensors -> (layer index, 0=up 1=gate 2=down),
+    // for the scheduler's expert-source callback (prefill offload copies)
+    struct src_ref { size_t layer_idx; int kind; };
+    std::map<const ggml_tensor *, src_ref> by_src;
+
+    // prefill D2D sourcing (LLAMA_MOE_CACHE_PREFILL_D2D, default on) + telemetry
+    bool     prefill_d2d          = true;
+    uint64_t n_prefill_resolves   = 0; // callback calls that returned a mapping
+    uint64_t n_prefill_resident   = 0; // resident entries handed out (upper bound of D2D expert copies)
+
     std::vector<ggml_context *>         ctxs;
     std::vector<ggml_backend_buffer_t>  bufs;
 
@@ -536,6 +546,9 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
             ggml_backend_tensor_set(ls.pub.host_table, dummy.data(), 0, n_expert*sizeof(int32_t));
 
             mc->by_up_src[ls.pub.up_src] = &ls - mc->layers.data();
+            mc->by_src[ls.pub.up_src]   = { (size_t) (&ls - mc->layers.data()), 0 };
+            mc->by_src[ls.pub.gate_src] = { (size_t) (&ls - mc->layers.data()), 1 };
+            mc->by_src[ls.pub.down_src] = { (size_t) (&ls - mc->layers.data()), 2 };
             vram += ggml_nbytes(ls.pub.up_c) + ggml_nbytes(ls.pub.gate_c) + ggml_nbytes(ls.pub.down_c);
             LLAMA_LOG_DEBUG("moe-cache: init layer %d '%s' %zu bytes/expert, experts in %s\n",
                     ls.pub.il, ls.pub.up_src->name, ls.pub.up_src->nb[2],
@@ -554,6 +567,12 @@ void llama_moe_cache_init(const llama_model & model, int32_t n_slots, int32_t ma
                 }
             }
         }
+
+        if (const char * v = getenv("LLAMA_MOE_CACHE_PREFILL_D2D")) {
+            mc->prefill_d2d = atoi(v) != 0;
+        }
+        LLAMA_LOG_INFO("%s: MoE expert cache prefill D2D sourcing %s (resident experts of an offloaded batch are copied "
+                "from their cache slot instead of from host)\n", __func__, mc->prefill_d2d ? "enabled" : "disabled by LLAMA_MOE_CACHE_PREFILL_D2D=0");
 
         if (const char * v = getenv("LLAMA_MOE_CACHE_VERIFY")) {
             mc->verify = atoi(v);
@@ -774,6 +793,41 @@ int llama_moe_cache_max_batch() {
     return g_cache ? g_cache->max_batch : 1;
 }
 
+bool llama_moe_cache_expert_src(const ggml_tensor * weight, const ggml_tensor ** cache, int32_t * slot, int64_t n_expert, void * user_data) {
+    GGML_UNUSED(user_data);
+    moe_cache * mc = g_cache;
+    if (!mc || !mc->prefill_d2d) {
+        return false;
+    }
+    auto it = mc->by_src.find(weight);
+    if (it == mc->by_src.end()) {
+        return false;
+    }
+    layer_state & ls = mc->layers[it->second.layer_idx];
+    if ((int64_t) ls.expert_slot.size() != n_expert) {
+        return false;
+    }
+
+    // expert_slot is only modified in step(), which runs on the decode thread between
+    // two graph executions - the same thread that executes the scheduler and calls
+    // here - so the mapping cannot change under the caller. The lock only orders
+    // against the observer callback, which does not touch expert_slot anyway.
+    std::lock_guard<std::mutex> lock(mc->mtx);
+    uint64_t resident = 0;
+    for (int64_t e = 0; e < n_expert; ++e) {
+        slot[e] = ls.expert_slot[e]; // -1 = not resident (never an in-flight slot: the entry is cleared before an upload is queued)
+        resident += ls.expert_slot[e] >= 0;
+    }
+    switch (it->second.kind) {
+        case 0:  *cache = ls.pub.up_c;   break;
+        case 1:  *cache = ls.pub.gate_c; break;
+        default: *cache = ls.pub.down_c; break;
+    }
+    mc->n_prefill_resolves++;
+    mc->n_prefill_resident += resident;
+    return true;
+}
+
 void llama_moe_cache_print_stats() {
     moe_cache * mc = g_cache;
     if (!mc) {
@@ -812,6 +866,9 @@ void llama_moe_cache_print_stats() {
         LLAMA_LOG_INFO("%s: MoE expert cache VERIFY level %d: table-checks=%" PRIu64 " slot-checks=%" PRIu64 " mismatches=0\n",
                 __func__, mc->verify, mc->n_verify_tables, mc->n_verify_slots);
     }
+    LLAMA_LOG_INFO("%s: MoE expert cache prefill D2D: %s, weight-resolves=%" PRIu64 " resident-entries=%" PRIu64
+            " (experts of offloaded batches sourced from VRAM instead of host, upper bound)\n",
+            __func__, mc->prefill_d2d ? "on" : "off", mc->n_prefill_resolves, mc->n_prefill_resident);
     if (mc->n_skip_wide_batch) {
         LLAMA_LOG_INFO("%s: MoE expert cache bypassed on %" PRIu64 " steps: batch wider than --moe-expert-cache-max-batch (%d), "
                 "e.g. speculative decoding drafts. The cache cannot be used for those tokens.\n",
