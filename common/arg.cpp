@@ -2535,6 +2535,49 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             LOG_WRN("DEPRECATED: --defrag-thold is deprecated and no longer necessary to specify\n");
         }
     ).set_env("LLAMA_ARG_DEFRAG_THOLD"));
+    add_opt(common_arg(
+        {"--moe-expert-cache"}, "N",
+        string_format("GPU cache slots per host-resident MoE expert layer, 0 = disabled (default: %d)", params.n_moe_cache_slots),
+        [](common_params & params, int value) {
+            params.n_moe_cache_slots = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE"));
+    add_opt(common_arg(
+        {"--moe-expert-cache-inserts"}, "N",
+        string_format("max expert uploads per layer per decode step for the MoE expert cache (default: %d)", params.n_moe_cache_inserts),
+        [](common_params & params, int value) {
+            params.n_moe_cache_inserts = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_INSERTS"));
+    add_opt(common_arg(
+        {"--moe-expert-cache-window"}, "N",
+        string_format("half life, in decode steps, of the MoE expert cache's windowed use counter; "
+            "an expert that has not been used recently is not worth a PCIe upload (0 = count all time, "
+            "default: %d). 16 with admit=3 measured 5x less PCIe and +8pp hit rate", params.n_moe_cache_half_life),
+        [](common_params & params, int value) {
+            params.n_moe_cache_half_life = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_WINDOW"));
+    add_opt(common_arg(
+        {"--moe-expert-cache-admit"}, "N",
+        string_format("how many times an expert must be used inside the window before it is admitted to "
+            "the MoE expert cache; 1 disables the gate (default: %d). Ungated admission churns: "
+            "an expert seen once can displace a hot one and the upload worker saturates", params.n_moe_cache_admit),
+        [](common_params & params, int value) {
+            params.n_moe_cache_admit = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_ADMIT"));
+    add_opt(common_arg(
+        {"--moe-expert-cache-max-batch"}, "N",
+        string_format("largest decode batch (single token + spec-decoding drafts) the MoE expert cache "
+            "graph is built for; larger batches take the stock path (default: %d). Keep this within the "
+            "CUDA mul_mat_id vector-kernel window: the cache maps every uncached expert of a token to the "
+            "same dummy slot, and the batched mul_mat_id kernels assume the ids of a token are distinct",
+            params.n_moe_cache_max_batch),
+        [](common_params & params, int value) {
+            params.n_moe_cache_max_batch = value;
+        }
+    ).set_env("LLAMA_ARG_MOE_EXPERT_CACHE_MAX_BATCH"));
     if (ex == LLAMA_EXAMPLE_SERVER) {
         // this is to make sure this option appears in the server-specific section of the help message
         add_opt(common_arg(

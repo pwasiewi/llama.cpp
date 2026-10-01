@@ -1,5 +1,7 @@
 #include "llama-context.h"
 
+#include "llama-moecache.h"
+
 #include "ggml.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
@@ -91,6 +93,13 @@ llama_context::llama_context(
     // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
     //     may need to be backend-dependent
     LLAMA_LOG_INFO("%s: constructing llama_context\n", __func__);
+
+    // The MoE expert cache must exist before sched_reserve(): the cache chain adds
+    // nodes to the graph (get_rows + 3 mul_mat_id + swilu + add per cached layer),
+    // and the scheduler's worst-case buffers are sized from the reserved graph.
+    // It allocates its own device memory, so leave room for it with --fit-target.
+    llama_moe_cache_init(model, params.n_moe_cache_slots, params.n_moe_cache_inserts, params.n_moe_cache_max_batch,
+            params.n_moe_cache_half_life, params.n_moe_cache_admit);
 
     t_start_us = model.t_start_us;
     t_load_us  = model.t_load_us;
@@ -482,6 +491,8 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    llama_moe_cache_print_stats();
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
@@ -2090,6 +2101,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
+
+    // apply throttled MoE expert-cache updates between graph executions
+    llama_moe_cache_step(sched.get());
 
     return 0;
 }
@@ -3730,6 +3744,11 @@ llama_context_params llama_context_default_params() {
         /*.yarn_beta_slow              =*/ -1.0f,
         /*.yarn_orig_ctx               =*/ 0,
         /*.defrag_thold                =*/ -1.0f,
+        /*.n_moe_cache_slots           =*/ 0,
+        /*.n_moe_cache_inserts         =*/ 2,
+        /*.n_moe_cache_max_batch       =*/ 1,
+        /*.n_moe_cache_half_life       =*/ 16,
+        /*.n_moe_cache_admit           =*/ 3,
         /*.cb_eval                     =*/ nullptr,
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,

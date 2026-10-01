@@ -2455,6 +2455,11 @@ common_params common_base_params_to_speculative(const common_params & params) {
     result.embedding    = false;
     result.pooling_type = LLAMA_POOLING_TYPE_UNSPECIFIED;
 
+    // the MoE expert cache is a process singleton bound to the target model; a
+    // speculative context must not request it, or it would rebind the cache to
+    // the draft model and silently stop serving the target
+    result.n_moe_cache_slots = 0;
+
     if (has_draft) {
         // default to global devices value
         if (!params_spec.devices.empty()) {
