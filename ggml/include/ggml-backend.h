@@ -364,6 +364,20 @@ extern "C" {
     typedef bool (*ggml_backend_sched_expert_src_callback)(const struct ggml_tensor * weight, const struct ggml_tensor ** cache, int32_t * slot, int64_t n_expert, void * user_data);
     GGML_API void                 ggml_backend_sched_set_expert_src_callback(ggml_backend_sched_t sched, ggml_backend_sched_expert_src_callback callback, void * user_data);
 
+    // Lookahead prefetch of offloaded MoE expert weights (port of PR #28414, --prefetch-experts-slots).
+    // Only engages for splits whose MUL_MAT_ID weight is host-resident (GGML_BACKEND_BUFFER_USAGE_WEIGHTS,
+    // e.g. --n-cpu-moe) during large batches (ids count >= 2 * n_expert, i.e. prefill); decode is unaffected.
+    // While split i computes, a second backend instance on the same device uploads the whole expert tensor
+    // of split i+2 into a rotating staging slot; the consuming split waits on the slot's ready event.
+    //   slots == 0 or 1 -> prefetch disabled (no memory overhead, default)
+    //   slots >= 2      -> enabled; GPU staging cost = slots * max expert tensor (alloc size); capped at
+    //                      GGML_SCHED_MAX_PREFETCH_SLOTS; on an allocation failure the feature switches itself off
+    // When an expert-source callback is registered, resident experts of the prefetched tensor are copied
+    // device -> device from the cache on the prefetch stream, the rest host -> device (same bytes).
+    // Must be called before the first graph compute on the scheduler. Single device only: splits on a
+    // device other than the one of the first prefetched split take the regular copy path.
+    GGML_API void                 ggml_backend_sched_set_prefetch_experts_slots(ggml_backend_sched_t sched, int slots);
+
     //
     // Meta backend
     //

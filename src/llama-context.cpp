@@ -280,6 +280,7 @@ llama_context::llama_context(
     }
 
     cparams.op_offload = params.op_offload;
+    cparams.prefetch_experts_slots = params.prefetch_experts_slots;
     cparams.kv_unified = params.kv_unified;
 
     // initialized later
@@ -651,6 +652,8 @@ void llama_context::sched_reserve() {
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
     // the MoE expert cache can source offloaded (prefill) expert copies from its slots; no-op without a cache
     ggml_backend_sched_set_expert_src_callback(sched.get(), llama_moe_cache_expert_src, nullptr);
+    // --prefetch-experts-slots: lookahead H2D staging of offloaded expert weights during prefill (0 = off)
+    ggml_backend_sched_set_prefetch_experts_slots(sched.get(), cparams.prefetch_experts_slots);
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -691,6 +694,7 @@ void llama_context::sched_reserve() {
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
                 ggml_backend_sched_set_expert_src_callback(sched.get(), llama_moe_cache_expert_src, nullptr);
+                ggml_backend_sched_set_prefetch_experts_slots(sched.get(), cparams.prefetch_experts_slots);
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -3764,6 +3768,7 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.prefetch_experts_slots      =*/ 0,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
