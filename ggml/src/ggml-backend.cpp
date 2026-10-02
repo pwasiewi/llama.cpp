@@ -1761,6 +1761,12 @@ static bool ggml_backend_sched_prefetch_init(ggml_backend_sched_t sched, ggml_ba
                 return true;
             }
             GGML_LOG_WARN("%s: failed to allocate expert prefetch slot %d (%zu bytes), expert prefetch disabled\n", __func__, i, size);
+            ggml_backend_synchronize(split_backend);
+            ggml_backend_synchronize(sched->prefetch_backend);
+            for (int j = 0; j < GGML_SCHED_MAX_PREFETCH_SLOTS; j++) {
+                if (sched->prefetch_slots[j]) { ggml_backend_buffer_free(sched->prefetch_slots[j]); sched->prefetch_slots[j] = NULL; }
+                sched->prefetch_used[j] = false;
+            }
             sched->prefetch_experts = false;
             return false;
         }
@@ -2428,6 +2434,10 @@ void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     for (int i = 0; i < sched->n_backends; i++) {
         ggml_backend_synchronize(sched->backends[i]);
+    }
+    if (sched->prefetch_backend) {
+        // prefetch uploads of a graph that returned an error may still be outstanding
+        ggml_backend_synchronize(sched->prefetch_backend);
     }
     if (!sched->is_alloc) {
         // if the graph is not already allocated, always use copy 0 after a synchronization
